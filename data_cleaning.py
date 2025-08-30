@@ -59,11 +59,13 @@ cleaned_df = cleaned_df[cleaned_df["reviewText"].notna() & (cleaned_df["reviewTe
 # ----------------------------
 def extract_rating(row):
     if pd.notna(row["stars"]) and str(row["stars"]).strip() != "":
-        return round(float(row["stars"]))
+        return (float(row["stars"]) - 1) / 4
     elif pd.notna(row["rating"]) and "/" in str(row["rating"]):
-        return round(float(str(row["rating"]).split("/")[0]))
+        num, den = str(row["rating"]).split("/")
+        num, den = float(num), float(den)
+        return num/den if den!=0 else np.nan
     elif pd.notna(row["rating"]):
-        return round(float(row["rating"]))
+        return (float(row["rating"]) - 1) / 4
     else:
         return np.nan
 
@@ -120,6 +122,10 @@ kaggle_df.rename(columns={
 
 # Set all categories to "Restaurant"
 kaggle_df["category"] = "Restaurant"
+
+# Normalise rating to 0-1
+kaggle_df["rating"] = kaggle_df["rating"].astype(float)
+kaggle_df["rating"] = (kaggle_df["rating"] - 1) / 4
 
 # Add missing columns
 for col_name in new_column_order:
