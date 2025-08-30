@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 import pytesseract
 from PIL import Image
+from pytesseract import Output
 
 
 def log(msg: str):
@@ -19,9 +20,43 @@ def pil_to_cv(img: Image.Image) -> np.ndarray:
     return _cv2.cvtColor(_np.array(img), _cv2.COLOR_RGB2BGR)
 
 
-def detect_qr_codes(img: Image.Image) -> bool:
-    """Detect presence of QR codes using OpenCV QRCodeDetector.
-    More permissive: treat detected points as QR presence even if decode fails.
+def _quad_plausible(points: np.ndarray, img_shape: tuple,
+                    min_area_ratio: float = 0.005,
+                    max_aspect_deviation: float = 0.35) -> bool:
+    """Validate that detected quad is large and roughly square.
+    - min_area_ratio: minimum area relative to image area to consider valid.
+    - max_aspect_deviation: allowed deviation from square (0.0 means perfect square).
+    """
+    try:
+        if points is None:
+            return False
+        # points can be shape (4,2) or (1,4,2)
+        pts = np.array(points, dtype=np.float32).reshape(-1, 2)
+        if pts.shape[0] < 4:
+            return False
+        area = cv2.contourArea(pts)
+        H, W = img_shape[:2]
+        img_area = float(H * W)
+        if img_area <= 0:
+            return False
+        if area / img_area < min_area_ratio:
+            return False
+        rect = cv2.minAreaRect(pts)
+        (cx, cy), (w, h), angle = rect
+        w, h = float(max(w, 1e-6)), float(max(h, 1e-6))
+        ar = max(w, h) / min(w, h)
+        # ar close to 1.0 for square; allow small deviation
+        if ar - 1.0 > max_aspect_deviation:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def detect_qr_codes(img: Image.Image, strict: bool = True) -> bool:
+    """Detect QR codes using OpenCV QRCodeDetector.
+    - strict=True (default): only flag when decoding succeeds.
+    - strict=False: also accept plausible quads when decode fails (may add false positives).
     """
     cv_img = pil_to_cv(img)
     detector = cv2.QRCodeDetector()
@@ -41,17 +76,20 @@ def detect_qr_codes(img: Image.Image) -> bool:
         try:
             data, points, _ = detector.detectAndDecode(v)
             if data:
+                log("QR detected via decode")
                 return True
-            if points is not None and len(points) > 0:
+            if not strict and _quad_plausible(points, v.shape):
+                log("QR plausible quad detected (non-strict)")
                 return True
             if hasattr(detector, "detectAndDecodeMulti"):
                 try:
                     retval, decoded_info, mpoints, _ = detector.detectAndDecodeMulti(v)  # type: ignore
-                    if retval:
-                        if decoded_info and any(bool(s) for s in decoded_info):
-                            return True
-                        if mpoints is not None and len(mpoints) > 0:
-                            return True
+                    if retval and decoded_info and any(bool(s) for s in decoded_info):
+                        log("QR detected via multi-decode")
+                        return True
+                    if not strict and _quad_plausible(mpoints, v.shape):
+                        log("QR plausible multi-quad detected (non-strict)")
+                        return True
                 except Exception:
                     pass
         except Exception:
@@ -59,24 +97,31 @@ def detect_qr_codes(img: Image.Image) -> bool:
     return False
 
 
-COUPON_KEYWORDS = [
-    # English core keywords
-    r"\bcoupon\b", r"\bvoucher\b", r"promo\s*code", r"\bdiscount\b",
-    r"\bdeal\b", r"special\s*offer", r"\boffer\b", r"cash\s*back|cashback",
-    r"\bsave\s*(up\s*to\s*)?\$?\d+%?\b", r"\bfree\b(\s*gift|\s*drink|\s*dessert)?",
-    r"\b\d{1,2}\s*%\s*off\b", r"\b\$\s?\d+\s*off\b", r"\brm\s?\d+\s*off\b",
-    r"flash\s*deal", r"\bsale\b", r"scan\s*to\s*(redeem|order|pay)",
-    r"use\s*code", r"\bqr\s*code\b", r"limited\s*time|limited\s*period",
-    r"buy\s*one\s*get\s*one|\bbogo\b", r"redeem\s*(at|now)",
-    r"member\s*price|member\s*exclusive", r"\bpromo\b",
+STRONG_COUPON_PATTERNS = [
+    r"\b\d{1,2}\s*%\s*off\b",
+    r"\b(?:rm|\$)\s?\d+\s*off\b",
+    r"promo\s*code",
+    r"use\s*code",
+    r"buy\s*one\s*get\s*one|\bbogo\b",
+    r"scan\s*to\s*(redeem|order|pay)",
+]
+
+WEAK_COUPON_KEYWORDS = [
+    r"\bcoupon\b", r"\bvoucher\b", r"\bdiscount\b", r"\bdeal\b",
+    r"special\s*offer", r"\boffer\b", r"cash\s*back|cashback",
+    r"\bsave\b", r"\bfree\b", r"\bsale\b", r"limited\s*time|limited\s*period",
+    r"redeem\s*(at|now)", r"member\s*price|member\s*exclusive", r"\bpromo\b",
     r"valid\s*until|expires\s*on",
     # Chinese / Japanese common variants
     r"特价", r"优惠", r"折扣", r"买一送一", r"优惠券", r"促销", r"クーポン",
 ]
 
 
-def ocr_coupon_hits(img: Image.Image, lang: str = "eng") -> bool:
-    """Run Tesseract OCR and search for coupon-like keywords with multiple variants."""
+def ocr_coupon_hits(img: Image.Image, lang: str = "eng", min_conf: int = 60,
+                    weak_threshold: int = 2) -> bool:
+    """Run Tesseract OCR and search for coupon-like keywords with multiple variants.
+    Uses word-level confidences; requires either a strong pattern or multiple weak keywords.
+    """
     tess_cmd = os.environ.get("TESSERACT_CMD", None)
     if tess_cmd:
         pytesseract.pytesseract.tesseract_cmd = tess_cmd
@@ -124,16 +169,36 @@ def ocr_coupon_hits(img: Image.Image, lang: str = "eng") -> bool:
         for psm in psm_modes:
             cfg = f"--oem 3 --psm {psm}"
             try:
-                text = pytesseract.image_to_string(v, lang=langs, config=cfg)
+                data = pytesseract.image_to_data(v, lang=langs, config=cfg, output_type=Output.DICT)
             except Exception:
                 continue
-            tl = text.lower()
-            if len(tl.strip()) < 5:
+            words = data.get("text", []) or []
+            confs = data.get("conf", []) or []
+            tokens = []
+            for w, c in zip(words, confs):
+                try:
+                    c = float(c)
+                except Exception:
+                    c = -1.0
+                if c >= float(min_conf):
+                    w = (w or "").strip().lower()
+                    if w:
+                        tokens.append(w)
+            if len(tokens) < 2:
                 continue
-            for kw in COUPON_KEYWORDS:
-                if re.search(kw, tl):
-                    log(f"Coupon keyword detected via OCR (psm={psm})")
+            tl = " ".join(tokens)
+            # Strong patterns first
+            for pat in STRONG_COUPON_PATTERNS:
+                if re.search(pat, tl):
+                    log(f"Coupon strong pattern via OCR (psm={psm})")
                     return True
+            # Count weak matches
+            weak_hits = 0
+            for kw in WEAK_COUPON_KEYWORDS:
+                if re.search(kw, tl):
+                    weak_hits += 1
+            if weak_hits >= weak_threshold:
+                log(f"Coupon weak keywords via OCR (psm={psm}, hits={weak_hits})")
+                return True
 
     return False
-

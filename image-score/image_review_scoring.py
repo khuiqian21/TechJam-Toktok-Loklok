@@ -344,35 +344,26 @@ def score_single_image(ctx: CLIPContext, img: Image.Image,
                        run_ocr_lang: str = "eng",
                        text_gamma: float = 1.5,
                        rel_gamma: float = 1.2,
-                       clarity_scale: float = 400.0,
-                       combine_contrast: float = 1.0) -> Tuple[float, bool]:
+                       clarity_scale: float = 400.0) -> Tuple[float, float, float, bool]:
     # 1) Text-image similarity using review content
     txt_sim_sc = review_text_similarity(ctx, img, review_text)
     txt_sim_sc = apply_gamma(txt_sim_sc, text_gamma)
-    log(f"Text similarity scored: {txt_sim_sc:.3f} (gamma={text_gamma})")
 
     # 2) Relevance score (to location/category)
     rel_sc = relevance_score(ctx, img, location_name, category)
     rel_sc = apply_gamma(rel_sc, rel_gamma)
-    log(f"Relevance scored: {rel_sc:.3f} (gamma={rel_gamma}, location='{str(location_name)[:30]}', category='{str(category)[:30]}')")
 
     # 3) Clarity/blur score
     var_lap = compute_blur_variance(img)
     clarity_sc = normalize_blur_score(var_lap, scale=clarity_scale)
-    log(f"Clarity scored: {clarity_sc:.3f} (var_lap={var_lap:.1f}, scale={clarity_scale})")
 
     # 4) Advertisement detection (QR or OCR coupon keywords)
     has_qr = detect_qr_codes(img)
     has_coupon = ocr_coupon_hits(img, lang=run_ocr_lang)
     is_ad = bool(has_qr or has_coupon)
-    log(f"Ad detection: qr={has_qr}, coupon_keywords={has_coupon}, is_ad={is_ad}")
 
-    # Combine component scores into a single per-image score
-    w_text, w_rel, w_clarity = 0.4, 0.4, 0.2
-    combined_single = (w_text * txt_sim_sc) + (w_rel * rel_sc) + (w_clarity * clarity_sc)
-    combined_single = apply_contrast_sigmoid(combined_single, combine_contrast)
-    log(f"Single image combined score: {combined_single:.3f} (contrast_k={combine_contrast})")
-    return float(combined_single), is_ad
+    # Return component scores for aggregation at review level
+    return float(txt_sim_sc), float(rel_sc), float(clarity_sc), is_ad
 
 
 def combine_scores(img_scores: List[float]) -> float:
@@ -383,8 +374,6 @@ def combine_scores(img_scores: List[float]) -> float:
     if not img_scores:
         return float('nan')
     return float(np.mean(img_scores))
-
-
 
 
 

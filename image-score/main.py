@@ -1,5 +1,6 @@
 import argparse
 from typing import List, Optional
+import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from image_review_scoring import (
@@ -8,7 +9,6 @@ from image_review_scoring import (
     safe_split_urls,
     download_image,
     score_single_image,
-    combine_scores,
 )
 
 
@@ -25,15 +25,17 @@ def process_dataframe(df: pd.DataFrame,
                       clarity_scale: float = 400.0,
                       combine_contrast: float = 1.0) -> pd.DataFrame:
     """
-    Process a DataFrame and append the two requested columns:
-      - combined_image_score (float)
-      - isAdvertistment (int flag)
+    Process a DataFrame and append the requested columns:
+      - combined_score_relevance: avg of per-image (review_text_similarity and relevance)
+      - combined_score_quality: avg of per-image clarity scores
+      - isAdvertisement: OR over per-image ad flags (QR or coupon keyword)
     """
     # Prepare CLIP (once)
     log("Loading CLIP model (ViT-B-32, openai weights)...")
     ctx = build_clip(device=device)
 
-    combined_scores: List[float] = []
+    rel_scores_out: List[float] = []
+    qual_scores_out: List[float] = []
     ad_flags: List[int] = []
 
     # Log input schema and attempt to auto-detect image column if missing
@@ -58,7 +60,9 @@ def process_dataframe(df: pd.DataFrame,
         if max_images_per_review > 0:
             urls = urls[:max_images_per_review]
 
-        per_image_scores: List[float] = []
+        text_sims: List[float] = []
+        rel_sims: List[float] = []
+        clarities: List[float] = []
         is_ad_any = False
         log(f"Review {idx+1}/{n}: processing {len(urls)} image(s)")
 
@@ -76,7 +80,7 @@ def process_dataframe(df: pd.DataFrame,
             except Exception:
                 log(f"Loaded image from URL: {short_u}")
             try:
-                sc, is_ad = score_single_image(
+                txt_sc, rel_sc, clarity_sc, is_ad = score_single_image(
                     ctx, img,
                     location_name=str(row.get(location_col, "")),
                     category=str(row.get(category_col, "")),
@@ -85,9 +89,10 @@ def process_dataframe(df: pd.DataFrame,
                     text_gamma=text_gamma,
                     rel_gamma=rel_gamma,
                     clarity_scale=clarity_scale,
-                    combine_contrast=combine_contrast
                 )
-                per_image_scores.append(sc)
+                text_sims.append(float(txt_sc))
+                rel_sims.append(float(rel_sc))
+                clarities.append(float(clarity_sc))
                 is_ad_any = is_ad_any or is_ad
             except Exception as e:
                 # Skip image on error
@@ -99,15 +104,21 @@ def process_dataframe(df: pd.DataFrame,
             rv_short = (rv[:120] + '...') if len(rv) > 120 else rv
             log(f"No image URLs parsed for review {idx+1}. Raw field value: {rv_short!r}")
 
-        combined = combine_scores(per_image_scores)
-        combined_scores.append(combined)
+        if len(text_sims) > 0:
+            mean_txt = float(np.mean(text_sims))
+            mean_rel = float(np.mean(rel_sims)) if len(rel_sims) > 0 else float('nan')
+            rel_scores_out.append(float(np.mean([mean_txt, mean_rel])))
+            qual_scores_out.append(float(np.mean(clarities)) if len(clarities) > 0 else float('nan'))
+        else:
+            rel_scores_out.append(float('nan'))
+            qual_scores_out.append(float('nan'))
         ad_flags.append(int(is_ad_any))
-        log(f"Review {idx+1}/{n} combined score: {combined if combined==combined else float('nan'):.3f}, isAdvertistment={int(is_ad_any)}")
+        log(f"Review {idx+1}/{n} combined_score_relevance: {rel_scores_out[-1] if rel_scores_out[-1]==rel_scores_out[-1] else float('nan'):.3f}, combined_score_quality: {qual_scores_out[-1] if qual_scores_out[-1]==qual_scores_out[-1] else float('nan'):.3f}, isAdvertisement={int(is_ad_any)}")
 
     df = df.copy()
-    df["combined_image_score"] = combined_scores
-    # Keep user's requested column name spellings
-    df["isAdvertistment"] = ad_flags
+    df["combined_score_relevance"] = rel_scores_out
+    df["combined_score_quality"] = qual_scores_out
+    df["isAdvertisement"] = ad_flags
     return df
 
 def read_table(path: str) -> pd.DataFrame:
@@ -137,10 +148,7 @@ def main():
     parser.add_argument("--text_gamma", type=float, default=1.5, help="Gamma for text-image similarity to increase contrast.")
     parser.add_argument("--rel_gamma", type=float, default=1.2, help="Gamma for relevance score to increase contrast.")
     parser.add_argument("--clarity_scale", type=float, default=400.0, help="Scale for clarity mapping; lower spreads scores more.")
-    parser.add_argument("--combine_contrast", type=float, default=1.0, help="Sigmoid slope for combined score; >1 broadens spread.")
-    parser.add_argument("--post_norm", default="none", choices=["none", "minmax", "zscore", "rank"],
-                        help="Dataset-level normalization applied to combined_image_score.")
-
+ 
     args = parser.parse_args()
 
     df = read_table(args.input)
@@ -156,37 +164,8 @@ def main():
         text_gamma=args.text_gamma,
         rel_gamma=args.rel_gamma,
         clarity_scale=args.clarity_scale,
-        combine_contrast=args.combine_contrast,
     )
-    # Optional post-normalization for broader spread
-    scores = out_df["combined_image_score"].to_numpy(dtype=float)
-    mask = ~np.isnan(scores)
-    method = (args.post_norm or "none").lower()
-    # Allow env override IMG_SCORE_POST_NORM
-    import os as _os
-    env_method = (_os.environ.get("IMG_SCORE_POST_NORM", "") or "").lower()
-    if env_method in {"minmax", "zscore", "rank", "none"} and env_method != "":
-        method = env_method
-    if mask.any() and method in {"minmax", "zscore", "rank"}:
-        vals = scores[mask]
-        if method == "minmax":
-            vmin, vmax = float(np.min(vals)), float(np.max(vals))
-            if vmax > vmin:
-                scores[mask] = (vals - vmin) / (vmax - vmin)
-                log(f"Post-norm minmax applied (min={vmin:.4f}, max={vmax:.4f}).")
-        elif method == "zscore":
-            mu, sigma = float(np.mean(vals)), float(np.std(vals) + 1e-8)
-            z = (vals - mu) / sigma
-            scores[mask] = 0.5 * (1.0 + np.vectorize(math.erf)(z / math.sqrt(2.0)))
-            log(f"Post-norm zscore->CDF applied (mean={mu:.4f}, std={sigma:.4f}).")
-        elif method == "rank":
-            order = np.argsort(vals)
-            ranks = np.empty_like(order, dtype=float)
-            ranks[order] = np.arange(len(vals), dtype=float)
-            denom = max(1.0, float(len(vals) - 1))
-            scores[mask] = ranks / denom
-            log("Post-norm rank applied (uniform 0..1 spread).")
-        out_df["combined_image_score"] = scores
+
     write_table(out_df, args.output)
     log(f"Done. Wrote: {args.output}")
 
