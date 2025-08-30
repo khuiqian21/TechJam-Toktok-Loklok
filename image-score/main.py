@@ -1,5 +1,5 @@
 import argparse
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
@@ -9,7 +9,12 @@ from image_review_scoring import (
     safe_split_urls,
     download_image,
     score_single_image,
+    image_features_batch,
+    precompute_review_text_feature,
+    precompute_relevance_text_features,
 )
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from PIL import Image
 
 
 def process_dataframe(df: pd.DataFrame,
@@ -23,7 +28,12 @@ def process_dataframe(df: pd.DataFrame,
                       text_gamma: float = 1.5,
                       rel_gamma: float = 1.2,
                       clarity_scale: float = 400.0,
-                      combine_contrast: float = 1.0) -> pd.DataFrame:
+                      qr_non_strict: bool = False,
+                      fast_ocr: bool = False,
+                      ocr_min_conf: int = 60,
+                      ocr_weak_threshold: int = 2,
+                      max_workers: int = 8,
+                      max_image_size: int = 1024) -> pd.DataFrame:
     """
     Process a DataFrame and append the requested columns:
       - combined_score_relevance: avg of per-image (review_text_similarity and relevance)
@@ -66,22 +76,50 @@ def process_dataframe(df: pd.DataFrame,
         is_ad_any = False
         log(f"Review {idx+1}/{n}: processing {len(urls)} image(s)")
 
-        for u in urls:
+        # Concurrent downloads
+        def _fetch(u: str) -> Tuple[str, Optional[Image.Image]]:
             img = download_image(u)
             if img is None:
-                short_u = (u[:100] + '...') if len(u) > 100 else u
-                log(f"Failed to load image from URL: {short_u}")
-                continue
-            # Log successful image fetch for this URL
-            short_u = (u[:100] + '...') if len(u) > 100 else u
+                return (u, None)
+            # Downscale if too large (keep aspect ratio)
             try:
                 w, h = img.size
-                log(f"Loaded image from URL: {short_u} (size={w}x{h})")
+                mx = max(w, h)
+                if max_image_size and mx > max_image_size:
+                    scale = max_image_size / float(mx)
+                    nw, nh = int(w * scale), int(h * scale)
+                    img = img.resize((nw, nh), Image.BICUBIC)
             except Exception:
-                log(f"Loaded image from URL: {short_u}")
+                pass
+            return (u, img)
+
+        images: List[Image.Image] = []
+        if urls:
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                futures = [ex.submit(_fetch, u) for u in urls]
+                for fut in as_completed(futures):
+                    u, img = fut.result()
+                    if img is not None:
+                        images.append(img)
+
+        if not images:
+            # No images
+            rel_scores_out.append(float('nan'))
+            qual_scores_out.append(float('nan'))
+            ad_flags.append(0)
+            continue
+
+        # Batch CLIP features
+        img_feats = image_features_batch(ctx, images)  # [n, d]
+        # Precompute text features once per review
+        rt_feat = precompute_review_text_feature(ctx, str(row.get(review_text_col, "")))  # [1, d] or None
+        rel_txt = precompute_relevance_text_features(ctx, str(row.get(location_col, "")), str(row.get(category_col, "")))
+
+        # Per-image scoring using precomputed feats
+        for i, im in enumerate(images):
             try:
                 txt_sc, rel_sc, clarity_sc, is_ad = score_single_image(
-                    ctx, img,
+                    ctx, im,
                     location_name=str(row.get(location_col, "")),
                     category=str(row.get(category_col, "")),
                     review_text=str(row.get(review_text_col, "")),
@@ -89,6 +127,13 @@ def process_dataframe(df: pd.DataFrame,
                     text_gamma=text_gamma,
                     rel_gamma=rel_gamma,
                     clarity_scale=clarity_scale,
+                    qr_strict=(not qr_non_strict),
+                    fast_ocr=fast_ocr,
+                    ocr_min_conf=ocr_min_conf,
+                    ocr_weak_threshold=ocr_weak_threshold,
+                    img_feat=img_feats[i:i+1],
+                    review_text_feat=rt_feat,
+                    rel_txt_feats=rel_txt,
                 )
                 text_sims.append(float(txt_sc))
                 rel_sims.append(float(rel_sc))
@@ -96,7 +141,6 @@ def process_dataframe(df: pd.DataFrame,
                 is_ad_any = is_ad_any or is_ad
             except Exception as e:
                 # Skip image on error
-                log(f"Error scoring image from URL: {short_u} ({type(e).__name__}: {str(e)[:120]})")
                 continue
 
         if len(urls) == 0:
@@ -148,7 +192,13 @@ def main():
     parser.add_argument("--text_gamma", type=float, default=1.5, help="Gamma for text-image similarity to increase contrast.")
     parser.add_argument("--rel_gamma", type=float, default=1.2, help="Gamma for relevance score to increase contrast.")
     parser.add_argument("--clarity_scale", type=float, default=400.0, help="Scale for clarity mapping; lower spreads scores more.")
- 
+    parser.add_argument("--qr_non_strict", action="store_true", help="Allow QR detection without successful decode (faster, may increase FPs).")
+    parser.add_argument("--fast_ocr", action="store_true", help="Use faster OCR pass with fewer variants and PSM modes.")
+    parser.add_argument("--ocr_min_conf", type=int, default=60, help="Minimum OCR word confidence to consider.")
+    parser.add_argument("--ocr_weak_threshold", type=int, default=2, help="Weak keyword hits required to flag coupon.")
+    parser.add_argument("--max_workers", type=int, default=8, help="Thread pool size for concurrent downloads.")
+    parser.add_argument("--max_image_size", type=int, default=1024, help="Max long-side image size before downscaling.")
+    
     args = parser.parse_args()
 
     df = read_table(args.input)
@@ -164,6 +214,12 @@ def main():
         text_gamma=args.text_gamma,
         rel_gamma=args.rel_gamma,
         clarity_scale=args.clarity_scale,
+        qr_non_strict=args.qr_non_strict,
+        fast_ocr=args.fast_ocr,
+        ocr_min_conf=args.ocr_min_conf,
+        ocr_weak_threshold=args.ocr_weak_threshold,
+        max_workers=args.max_workers,
+        max_image_size=args.max_image_size,
     )
 
     write_table(out_df, args.output)

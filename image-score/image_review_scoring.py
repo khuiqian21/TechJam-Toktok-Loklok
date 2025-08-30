@@ -1,9 +1,6 @@
-import argparse
 import io
 import math
-import os
 import re
-import sys
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -17,7 +14,6 @@ from PIL import Image, ImageOps
 import cv2
 
 # OCR
-import pytesseract
 from advertisement_detection import detect_qr_codes, ocr_coupon_hits
 
 # CLIP
@@ -48,15 +44,12 @@ def safe_split_urls(s: str) -> List[str]:
                 return [str(x).strip() for x in arr if str(x).strip()]
     except Exception:
         pass
-    # Split on comma; then additionally split on newlines/semicolons
-    parts = [p.strip() for p in s.split(',')]
-    out = []
-    for p in parts:
-        out.extend([q.strip() for q in re.split(r'[;\n]+', p) if q.strip()])
+    # Split on common delimiters: comma, pipe, semicolon, newline, tabs
+    tokens = [t.strip() for t in re.split(r'[\,\|;\n\t]+', s) if t.strip()]
     # Deduplicate preserving order
     seen = set()
-    uniq = []
-    for x in out:
+    uniq: List[str] = []
+    for x in tokens:
         if x not in seen:
             seen.add(x)
             uniq.append(x)
@@ -175,9 +168,32 @@ class CLIPContext:
 def build_clip(device: Optional[str] = None) -> CLIPContext:
     """
     Build an open-clip model (ViT-B-32) with OpenAI weights.
+    Selects a safe device if requested backend isn't available.
     """
+    def _mps_available() -> bool:
+        try:
+            return bool(getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() and torch.backends.mps.is_built())
+        except Exception:
+            return False
+
     if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif _mps_available():
+            device = "mps"
+        else:
+            device = "cpu"
+    else:
+        req = str(device).lower()
+        if req == "cuda" and not torch.cuda.is_available():
+            log("CUDA requested but not available. Falling back to CPU.")
+            device = "cpu"
+        elif req in ("mps", "metal") and not _mps_available():
+            log("MPS requested but not available. Falling back to CPU.")
+            device = "cpu"
+        elif req not in ("cuda", "cpu", "mps"):
+            # Unknown device string; choose safely
+            device = "cpu"
 
     model, _, preprocess = open_clip.create_model_and_transforms(
         'ViT-B-32', pretrained='openai'
@@ -258,6 +274,16 @@ def image_features(ctx: CLIPContext, img: Image.Image) -> torch.Tensor:
 
 
 @torch.no_grad()
+def image_features_batch(ctx: CLIPContext, imgs: List[Image.Image]) -> torch.Tensor:
+    if not imgs:
+        return torch.empty((0, ctx.model.visual.output_dim), device=ctx.device)
+    batch = torch.stack([ctx.preprocess(im) for im in imgs], dim=0).to(ctx.device)
+    feats = ctx.model.encode_image(batch)
+    feats = feats / feats.norm(dim=-1, keepdim=True)
+    return feats  # [n, d]
+
+
+@torch.no_grad()
 def text_features(ctx: CLIPContext, prompts: List[str]) -> torch.Tensor:
     key = "||".join(prompts).lower()
     if key in ctx.dynamic_text_cache:
@@ -272,6 +298,33 @@ def text_features(ctx: CLIPContext, prompts: List[str]) -> torch.Tensor:
 def cosine_sim(img_feats: torch.Tensor, txt_feats: torch.Tensor) -> torch.Tensor:
     """Cosine similarity matrix [n_img x n_txt]. img_feats and txt_feats must be L2-normalized."""
     return img_feats @ txt_feats.T
+
+
+def precompute_review_text_feature(ctx: CLIPContext, review_text: str) -> Optional[torch.Tensor]:
+    if not isinstance(review_text, str) or not review_text.strip():
+        return None
+    return text_features(ctx, [review_text])  # [1, d]
+
+
+def precompute_relevance_text_features(ctx: CLIPContext, location_name: str, category: str) -> torch.Tensor:
+    prompts = []
+    if isinstance(location_name, str) and location_name.strip():
+        ln = location_name.strip()
+        prompts.extend([
+            f"a photo of {ln} storefront sign",
+            f"the exterior of {ln} restaurant or shop",
+            f"the interior of {ln}",
+        ])
+    if isinstance(category, str) and category.strip():
+        cat = category.strip()
+        prompts.extend([
+            f"{cat} food",
+            f"a {cat} restaurant dish",
+            f"a {cat} restaurant interior",
+        ])
+    if not prompts:
+        prompts = ["a restaurant", "a cafe", "a plate of food"]
+    return text_features(ctx, prompts)
 
 
 def group_max_similarity(img_feats: torch.Tensor, group_txt: torch.Tensor) -> float:
@@ -344,13 +397,31 @@ def score_single_image(ctx: CLIPContext, img: Image.Image,
                        run_ocr_lang: str = "eng",
                        text_gamma: float = 1.5,
                        rel_gamma: float = 1.2,
-                       clarity_scale: float = 400.0) -> Tuple[float, float, float, bool]:
+                       clarity_scale: float = 400.0,
+                       qr_strict: bool = True,
+                       fast_ocr: bool = False,
+                       ocr_min_conf: int = 60,
+                       ocr_weak_threshold: int = 2,
+                       img_feat: Optional[torch.Tensor] = None,
+                       review_text_feat: Optional[torch.Tensor] = None,
+                       rel_txt_feats: Optional[torch.Tensor] = None) -> Tuple[float, float, float, bool]:
     # 1) Text-image similarity using review content
-    txt_sim_sc = review_text_similarity(ctx, img, review_text)
+    if img_feat is None:
+        img_feat = image_features(ctx, img)  # [1, d]
+    if review_text_feat is None:
+        txt_sim_sc = review_text_similarity(ctx, img, review_text)
+    else:
+        sim = cosine_sim(img_feat, review_text_feat)
+        txt_sim_sc = float((sim.item() + 1.0) / 2.0)
     txt_sim_sc = apply_gamma(txt_sim_sc, text_gamma)
 
     # 2) Relevance score (to location/category)
-    rel_sc = relevance_score(ctx, img, location_name, category)
+    if rel_txt_feats is None:
+        rel_sc = relevance_score(ctx, img, location_name, category)
+    else:
+        sims = cosine_sim(img_feat, rel_txt_feats)  # [1, n]
+        sim_max = float(sims.max().item())
+        rel_sc = float((sim_max + 1.0) / 2.0)
     rel_sc = apply_gamma(rel_sc, rel_gamma)
 
     # 3) Clarity/blur score
@@ -358,8 +429,9 @@ def score_single_image(ctx: CLIPContext, img: Image.Image,
     clarity_sc = normalize_blur_score(var_lap, scale=clarity_scale)
 
     # 4) Advertisement detection (QR or OCR coupon keywords)
-    has_qr = detect_qr_codes(img)
-    has_coupon = ocr_coupon_hits(img, lang=run_ocr_lang)
+    has_qr = detect_qr_codes(img, strict=qr_strict)
+    from advertisement_detection import ocr_coupon_hits as _ocr
+    has_coupon = _ocr(img, lang=run_ocr_lang, min_conf=ocr_min_conf, weak_threshold=ocr_weak_threshold, fast=fast_ocr)
     is_ad = bool(has_qr or has_coupon)
 
     # Return component scores for aggregation at review level
@@ -374,7 +446,4 @@ def combine_scores(img_scores: List[float]) -> float:
     if not img_scores:
         return float('nan')
     return float(np.mean(img_scores))
-
-
-
 

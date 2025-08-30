@@ -118,7 +118,7 @@ WEAK_COUPON_KEYWORDS = [
 
 
 def ocr_coupon_hits(img: Image.Image, lang: str = "eng", min_conf: int = 60,
-                    weak_threshold: int = 2) -> bool:
+                    weak_threshold: int = 2, fast: bool = False) -> bool:
     """Run Tesseract OCR and search for coupon-like keywords with multiple variants.
     Uses word-level confidences; requires either a strong pattern or multiple weak keywords.
     """
@@ -135,21 +135,22 @@ def ocr_coupon_hits(img: Image.Image, lang: str = "eng", min_conf: int = 60,
     variants: List[np.ndarray] = []
     try:
         variants.append(gray)
-        _, th_otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        variants.append(th_otsu)
-        th_gauss = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                          cv2.THRESH_BINARY, 31, 11)
-        variants.append(th_gauss)
-        th_mean = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-                                         cv2.THRESH_BINARY, 31, 11)
-        variants.append(th_mean)
-        variants.extend([255 - v for v in [th_otsu, th_gauss, th_mean] if v is not None])
-        blur = cv2.medianBlur(gray, 3)
-        variants.append(blur)
-        h, w = gray.shape[:2]
-        if min(h, w) < 700:
-            up = cv2.resize(gray, None, fx=1.8, fy=1.8, interpolation=cv2.INTER_LINEAR)
-            variants.append(up)
+        if not fast:
+            _, th_otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            variants.append(th_otsu)
+            th_gauss = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                              cv2.THRESH_BINARY, 31, 11)
+            variants.append(th_gauss)
+            th_mean = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                             cv2.THRESH_BINARY, 31, 11)
+            variants.append(th_mean)
+            variants.extend([255 - v for v in [th_otsu, th_gauss, th_mean] if v is not None])
+            blur = cv2.medianBlur(gray, 3)
+            variants.append(blur)
+            h, w = gray.shape[:2]
+            if min(h, w) < 700:
+                up = cv2.resize(gray, None, fx=1.8, fy=1.8, interpolation=cv2.INTER_LINEAR)
+                variants.append(up)
     except Exception:
         variants.append(gray)
 
@@ -162,10 +163,11 @@ def ocr_coupon_hits(img: Image.Image, lang: str = "eng", min_conf: int = 60,
         except Exception:
             pass
 
-    psm_modes = [11, 6, 3]
+    psm_modes = [6] if fast else [11, 6, 3]
     langs = lang or "eng"
 
-    for v in expanded[:10]:
+    limit = 3 if fast else 10
+    for v in expanded[:limit]:
         for psm in psm_modes:
             cfg = f"--oem 3 --psm {psm}"
             try:
