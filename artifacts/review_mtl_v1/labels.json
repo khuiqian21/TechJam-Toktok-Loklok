@@ -1,0 +1,11 @@
+{
+  "quality": {
+    "0": "Low",
+    "1": "Medium",
+    "2": "Good"
+  },
+  "relevance": {
+    "0": "Irrelevant",
+    "1": "Relevant"
+  }
+}

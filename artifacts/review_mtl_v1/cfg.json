@@ -1,0 +1,17 @@
+{
+  "encoder_name": "sentence-transformers/all-MiniLM-L6-v2",
+  "max_len": 128,
+  "classes_per_batch": 3,
+  "samples_per_class": 2,
+  "epochs_contrastive": 2,
+  "epochs_joint": 4,
+  "lr_encoder": 2e-05,
+  "lr_heads": 0.0002,
+  "weight_decay": 0.01,
+  "warmup_ratio": 0.1,
+  "label_smoothing": 0.05,
+  "lambda_contrastive": 0.1,
+  "temperature": 0.07,
+  "use_class_weights": true,
+  "device": "cpu"
+}
